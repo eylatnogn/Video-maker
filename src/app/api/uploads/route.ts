@@ -1,19 +1,23 @@
 import { jsonError } from "@/lib/api";
-import { config } from "@/lib/config";
 import { ValidationError } from "@/lib/pipeline/personas";
-import { saveFile, VIDEO_MIMES } from "@/lib/storage";
+import { saveFile } from "@/lib/storage";
+import { assertUploadAllowed, parseKind } from "@/lib/uploads";
 
 export const dynamic = "force-dynamic";
 
-/** Upload a custom driving video (the clip whose motion gets copied). */
+/**
+ * Multipart upload through the server. Used when files live on local disk.
+ * On Vercel the request body is capped at 4.5 MB, so the browser uploads
+ * straight to Blob instead (see ./token and /api/files).
+ */
 export async function POST(request: Request) {
   try {
     const form = await request.formData();
-    const video = form.get("video");
-    if (!(video instanceof File)) throw new ValidationError("video file is required");
-    if (!VIDEO_MIMES.has(video.type)) throw new ValidationError(`Unsupported video type: ${video.type || "unknown"}`);
-    if (video.size > config().limits.maxVideoBytes) throw new ValidationError("Video is too large");
-    const record = await saveFile(new Uint8Array(await video.arrayBuffer()), video.type, video.name);
+    const kind = parseKind(form.get("kind"));
+    const file = form.get("file");
+    if (!(file instanceof File)) throw new ValidationError("file is required");
+    assertUploadAllowed(kind, file.type, file.size);
+    const record = await saveFile(new Uint8Array(await file.arrayBuffer()), file.type, file.name);
     return Response.json({ file: record }, { status: 201 });
   } catch (err) {
     return jsonError(err);

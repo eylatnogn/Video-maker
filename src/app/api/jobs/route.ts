@@ -1,9 +1,9 @@
-import { after } from "next/server";
 import { z } from "zod";
 import { jsonError } from "@/lib/api";
-import { createJob, listJobs, runJob } from "@/lib/pipeline/jobs";
+import { createJob, listJobs } from "@/lib/pipeline/jobs";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 const CreateJobSchema = z
   .object({
@@ -21,6 +21,7 @@ export async function GET() {
   return Response.json({ jobs: await listJobs() });
 }
 
+/** Creates the job and submits it to the provider before responding. */
 export async function POST(request: Request) {
   try {
     const parsed = CreateJobSchema.safeParse(await request.json());
@@ -28,9 +29,6 @@ export async function POST(request: Request) {
       return Response.json({ error: parsed.error.issues.map((i) => i.message).join("; ") }, { status: 400 });
     }
     const job = await createJob(parsed.data);
-    // The render runs after the response is sent. Move this to a worker queue
-    // once you run more than one server instance.
-    after(() => runJob(job.id).catch((err) => console.error(`job ${job.id}`, err)));
     return Response.json({ job }, { status: 201 });
   } catch (err) {
     return jsonError(err);

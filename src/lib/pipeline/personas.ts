@@ -1,6 +1,6 @@
 import { config } from "../config";
 import { newId, nowIso } from "../ids";
-import { IMAGE_MIMES, saveFile } from "../storage";
+import { IMAGE_MIMES } from "../storage";
 import { store } from "../store";
 import type { Persona } from "../types";
 
@@ -11,20 +11,15 @@ export class ValidationError extends Error {
   readonly status = 400;
 }
 
-export interface PhotoUpload {
-  data: Uint8Array;
-  mime: string;
-  name: string;
-}
-
 export interface CreatePersonaInput {
   name: string;
-  photos: PhotoUpload[];
+  /** Ids of files already uploaded through the uploads API, best photo first. */
+  photoFileIds: string[];
   consent: boolean;
 }
 
 /**
- * Creates a persona from uploaded photos.
+ * Creates a persona from previously uploaded photos.
  *
  * The consent checkbox is the only gate here. A production deployment must
  * add something stronger (a live selfie compared against the uploads, or an
@@ -37,30 +32,31 @@ export async function createPersona(input: CreatePersonaInput): Promise<Persona>
   if (!name) throw new ValidationError("Name is required");
   if (name.length > 60) throw new ValidationError("Name must be 60 characters or fewer");
   if (!input.consent) throw new ValidationError("You must confirm the photos are of you");
-  if (input.photos.length < limits.minPhotos) {
+  const ids = [...new Set(input.photoFileIds)];
+  if (ids.length < limits.minPhotos) {
     throw new ValidationError(`Upload at least ${limits.minPhotos} photo`);
   }
-  if (input.photos.length > limits.maxPhotos) {
+  if (ids.length > limits.maxPhotos) {
     throw new ValidationError(`Upload at most ${limits.maxPhotos} photos`);
   }
-  for (const photo of input.photos) {
-    if (!IMAGE_MIMES.has(photo.mime)) {
-      throw new ValidationError(`Unsupported image type: ${photo.mime || "unknown"}`);
+  const db = await store().read();
+  for (const id of ids) {
+    const file = db.files.find((f) => f.id === id);
+    if (!file) throw new ValidationError(`Unknown photo ${id}`);
+    if (!IMAGE_MIMES.has(file.mime)) {
+      throw new ValidationError(`${file.originalName} is not a supported image`);
     }
-    if (photo.data.byteLength === 0) throw new ValidationError(`${photo.name} is empty`);
-    if (photo.data.byteLength > limits.maxPhotoBytes) {
-      throw new ValidationError(`${photo.name} is larger than ${limits.maxPhotoBytes / 1024 / 1024} MB`);
+    if (file.size === 0) throw new ValidationError(`${file.originalName} is empty`);
+    if (file.size > limits.maxPhotoBytes) {
+      throw new ValidationError(`${file.originalName} is larger than ${limits.maxPhotoBytes / 1024 / 1024} MB`);
     }
   }
-
-  const records = [];
-  for (const photo of input.photos) records.push(await saveFile(photo.data, photo.mime, photo.name));
 
   const persona: Persona = {
     id: newId("persona"),
     name,
-    photoIds: records.map((r) => r.id),
-    primaryPhotoId: records[0].id,
+    photoIds: ids,
+    primaryPhotoId: ids[0],
     consent: { confirmedAt: nowIso(), statement: CONSENT_STATEMENT },
     createdAt: nowIso(),
   };

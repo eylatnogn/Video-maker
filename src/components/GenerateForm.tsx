@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useState } from "react";
+import { uploadFile } from "@/lib/client/upload";
 import type { GenerationMode, Persona, Template } from "@/lib/types";
 
 type Source = { kind: "template"; templateId: string } | { kind: "upload" };
@@ -25,26 +26,22 @@ export function GenerateForm({
   const [mode, setMode] = useState<GenerationMode>("replace");
   const [prompt, setPrompt] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
-    setBusy(true);
     try {
       let drivingVideoFileId: string | undefined;
       let templateId: string | undefined;
       if (source.kind === "upload") {
         if (!video) throw new Error("Choose a video to copy the motion from");
-        const form = new FormData();
-        form.set("video", video);
-        const up = await fetch("/api/uploads", { method: "POST", body: form });
-        const upBody = await up.json();
-        if (!up.ok) throw new Error(upBody.error ?? "Upload failed");
-        drivingVideoFileId = upBody.file.id;
+        setBusy("Uploading clip…");
+        drivingVideoFileId = (await uploadFile(video, "video")).id;
       } else {
         templateId = source.templateId;
       }
+      setBusy("Submitting to the renderer…");
       const res = await fetch("/api/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -55,7 +52,7 @@ export function GenerateForm({
       router.push(`/jobs/${body.job.id}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-      setBusy(false);
+      setBusy(null);
     }
   }
 
@@ -157,8 +154,8 @@ export function GenerateForm({
 
       {error && <p className="text-sm text-red-400">{error}</p>}
 
-      <button type="submit" disabled={busy || !personaId} className="rounded bg-accent px-4 py-2 font-medium text-white disabled:opacity-40">
-        {busy ? "Starting…" : "Generate video"}
+      <button type="submit" disabled={busy !== null || !personaId} className="rounded bg-accent px-4 py-2 font-medium text-white disabled:opacity-40">
+        {busy ?? "Generate video"}
       </button>
     </form>
   );

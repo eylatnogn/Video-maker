@@ -8,12 +8,26 @@ import { getTemplate } from "../templates";
 import type { GenerationMode, Job, JobStatus } from "../types";
 import { ValidationError } from "./personas";
 
+/**
+ * Job lifecycle without a background process.
+ *
+ * - `createJob` validates, stores and submits to the provider in one go.
+ * - `refreshJob` performs a single provider status check. It is called by
+ *   the job endpoint whenever a client asks about a pending job, by the
+ *   cron endpoint, and (indirectly) by the provider webhook. That keeps
+ *   every request short, which is what serverless platforms require.
+ */
 export interface CreateJobInput {
   personaId: string;
   templateId?: string;
   drivingVideoFileId?: string;
   mode?: GenerationMode;
   prompt?: string;
+}
+
+export interface JobOptions {
+  provider?: VideoProvider;
+  now?: () => number;
 }
 
 const TERMINAL: ReadonlySet<JobStatus> = new Set(["completed", "failed", "canceled"]);
@@ -32,7 +46,7 @@ async function patchJob(id: string, patch: Partial<Job>, message?: string): Prom
   });
 }
 
-export async function createJob(input: CreateJobInput): Promise<Job> {
+export async function createJob(input: CreateJobInput, opts: JobOptions = {}): Promise<Job> {
   const db = await store().read();
   const persona = db.personas.find((p) => p.id === input.personaId);
   if (!persona) throw new ValidationError("Persona not found");
@@ -70,7 +84,7 @@ export async function createJob(input: CreateJobInput): Promise<Job> {
   await store().mutate((db) => {
     db.jobs.push(job);
   });
-  return job;
+  return submitJob(job.id, opts);
 }
 
 export async function listJobs(): Promise<Job[]> {
@@ -104,12 +118,18 @@ async function resolveInputs(job: Job): Promise<{ referenceImageUrls: string[]; 
   const persona = db.personas.find((p) => p.id === job.personaId);
   if (!persona) throw new Error("Persona was deleted");
   const ordered = [persona.primaryPhotoId, ...persona.photoIds.filter((p) => p !== persona.primaryPhotoId)];
-  const referenceImageUrls = ordered.map(publicFileUrl);
+  const referenceImageUrls = ordered.flatMap((id) => {
+    const file = db.files.find((f) => f.id === id);
+    return file ? [publicFileUrl(file)] : [];
+  });
+  if (referenceImageUrls.length === 0) throw new Error("Persona has no photos on file");
 
   let drivingVideoUrl: string;
   let prompt = job.prompt;
   if (job.drivingVideoFileId) {
-    drivingVideoUrl = publicFileUrl(job.drivingVideoFileId);
+    const file = db.files.find((f) => f.id === job.drivingVideoFileId);
+    if (!file) throw new Error("Driving video is missing");
+    drivingVideoUrl = publicFileUrl(file);
   } else {
     const template = await getTemplate(job.templateId ?? "");
     if (!template?.drivingVideoUrl) throw new Error("Template clip is missing");
@@ -121,117 +141,101 @@ async function resolveInputs(job: Job): Promise<{ referenceImageUrls: string[]; 
   return { referenceImageUrls, drivingVideoUrl, prompt };
 }
 
-export interface RunOptions {
-  provider?: VideoProvider;
-  pollIntervalMs?: number;
-  timeoutMs?: number;
-  sleep?: (ms: number) => Promise<void>;
-}
-
-const running = new Set<string>();
-
-/**
- * Drives one job from "queued" to a terminal state: submit, poll until the
- * provider finishes, then copy the output into local storage.
- *
- * It is idempotent per process (a second call for a running job returns
- * immediately) and survives a restart because a job found in "submitted" or
- * "processing" is resumed from its persisted provider request id.
- */
-export async function runJob(id: string, opts: RunOptions = {}): Promise<Job> {
-  if (running.has(id)) return (await getJob(id))!;
-  running.add(id);
+/** Sends a queued job to the provider. Safe to call again: it is a no-op once submitted. */
+export async function submitJob(id: string, opts: JobOptions = {}): Promise<Job> {
+  const job = await getJob(id);
+  if (!job) throw new Error(`Job ${id} not found`);
+  if (job.providerRequestId || isTerminal(job.status)) return job;
+  const cfg = config();
+  const videoProvider = opts.provider ?? defaultProvider();
   try {
-    return await runJobInner(id, opts);
-  } finally {
-    running.delete(id);
+    const inputs = await resolveInputs(job);
+    const webhookUrl = cfg.webhookSecret
+      ? `${cfg.publicBaseUrl}/api/webhooks/${videoProvider.id}?job=${job.id}&secret=${encodeURIComponent(cfg.webhookSecret)}`
+      : undefined;
+    const submitted = await videoProvider.submit({
+      jobId: job.id,
+      referenceImageUrls: inputs.referenceImageUrls,
+      drivingVideoUrl: inputs.drivingVideoUrl,
+      mode: job.mode,
+      prompt: inputs.prompt,
+      webhookUrl,
+    });
+    return patchJob(
+      id,
+      {
+        status: "submitted",
+        provider: videoProvider.id,
+        providerRequestId: submitted.providerRequestId,
+        providerMeta: submitted.meta,
+      },
+      `Submitted to ${videoProvider.id} as ${submitted.providerRequestId}`,
+    );
+  } catch (err) {
+    return patchJob(id, { status: "failed", error: errorMessage(err) }, `Submit failed: ${errorMessage(err)}`);
   }
 }
 
-async function runJobInner(id: string, opts: RunOptions): Promise<Job> {
-  const cfg = config();
-  const videoProvider = opts.provider ?? defaultProvider();
-  const pollIntervalMs = opts.pollIntervalMs ?? cfg.pollIntervalMs;
-  const timeoutMs = opts.timeoutMs ?? cfg.jobTimeoutMs;
-  const sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
-
+/**
+ * One provider status check. Returns the job unchanged when it is already
+ * terminal, so it is cheap to call on every read of a job.
+ */
+export async function refreshJob(id: string, opts: JobOptions = {}): Promise<Job> {
   let job = await getJob(id);
   if (!job) throw new Error(`Job ${id} not found`);
   if (isTerminal(job.status)) return job;
+  if (!job.providerRequestId) job = await submitJob(id, opts);
+  if (isTerminal(job.status) || !job.providerRequestId) return job;
 
-  if (!job.providerRequestId) {
-    try {
-      const inputs = await resolveInputs(job);
-      const webhookUrl = cfg.webhookSecret
-        ? `${cfg.publicBaseUrl}/api/webhooks/${videoProvider.id}?job=${job.id}&secret=${encodeURIComponent(cfg.webhookSecret)}`
-        : undefined;
-      const submitted = await videoProvider.submit({
-        jobId: job.id,
-        referenceImageUrls: inputs.referenceImageUrls,
-        drivingVideoUrl: inputs.drivingVideoUrl,
-        mode: job.mode,
-        prompt: inputs.prompt,
-        webhookUrl,
-      });
-      job = await patchJob(
-        id,
-        {
-          status: "submitted",
-          provider: videoProvider.id,
-          providerRequestId: submitted.providerRequestId,
-          providerMeta: submitted.meta,
-        },
-        `Submitted to ${videoProvider.id} as ${submitted.providerRequestId}`,
-      );
-    } catch (err) {
-      return patchJob(id, { status: "failed", error: errorMessage(err) }, `Submit failed: ${errorMessage(err)}`);
-    }
+  const now = opts.now ? opts.now() : Date.now();
+  if (now - Date.parse(job.createdAt) > config().jobTimeoutMs) {
+    return patchJob(id, { status: "failed", error: "Timed out waiting for provider" }, "Timed out");
   }
 
-  const startedAt = Date.parse(job.updatedAt);
-  let lastLogged = "";
-  for (;;) {
-    const fresh = await getJob(id);
-    if (!fresh || isTerminal(fresh.status)) return fresh ?? job;
-    if (Date.now() - startedAt > timeoutMs) {
-      return patchJob(id, { status: "failed", error: "Timed out waiting for provider" }, "Timed out");
-    }
-
-    let status;
-    try {
-      status = await videoProvider.status(fresh.providerRequestId!, fresh.providerMeta);
-    } catch (err) {
-      await patchJob(id, {}, `Status check error: ${errorMessage(err)}`);
-      await sleep(pollIntervalMs);
-      continue;
-    }
-
-    const lastLog = status.logs?.at(-1);
-    const logMessage = lastLog && lastLog !== lastLogged ? lastLog : undefined;
-    if (logMessage) lastLogged = logMessage;
-
-    if (status.state === "failed") {
-      return patchJob(id, { status: "failed", error: status.error ?? "Provider failed" }, `Failed: ${status.error ?? "unknown"}`);
-    }
-    if (status.state === "completed" && status.outputUrl) {
-      return finalize(id, status.outputUrl);
-    }
-    const nextStatus: JobStatus = status.state === "processing" ? "processing" : "submitted";
-    await patchJob(
-      id,
-      { status: nextStatus, progress: status.progress ?? fresh.progress },
-      nextStatus !== fresh.status ? `Provider is ${status.state}` : logMessage,
-    );
-    await sleep(pollIntervalMs);
+  const videoProvider = opts.provider ?? defaultProvider();
+  let status;
+  try {
+    status = await videoProvider.status(job.providerRequestId, job.providerMeta);
+  } catch (err) {
+    return patchJob(id, {}, `Status check error: ${errorMessage(err)}`);
   }
+
+  if (status.state === "failed") {
+    return patchJob(id, { status: "failed", error: status.error ?? "Provider failed" }, `Failed: ${status.error ?? "unknown"}`);
+  }
+  if (status.state === "completed" && status.outputUrl) {
+    return finalize(id, status.outputUrl);
+  }
+  const nextStatus: JobStatus = status.state === "processing" ? "processing" : "submitted";
+  const lastLog = status.logs?.at(-1);
+  const alreadyLogged = lastLog !== undefined && job.events.some((e) => e.message === lastLog);
+  return patchJob(
+    id,
+    { status: nextStatus, progress: status.progress ?? job.progress },
+    nextStatus !== job.status ? `Provider is ${status.state}` : alreadyLogged ? undefined : lastLog,
+  );
 }
 
-/** Records the provider output. Used by the poll loop and by webhooks. */
+/** Refreshes every pending job. Used by the cron endpoint. */
+export async function refreshPendingJobs(opts: JobOptions = {}): Promise<Job[]> {
+  const pending = (await listJobs()).filter((j) => !isTerminal(j.status));
+  const results: Job[] = [];
+  for (const job of pending) {
+    try {
+      results.push(await refreshJob(job.id, opts));
+    } catch (err) {
+      console.error(`refresh ${job.id}`, err);
+    }
+  }
+  return results;
+}
+
+/** Records the provider output. Used by the refresh path and by webhooks. */
 export async function finalize(id: string, outputUrl: string): Promise<Job> {
   const job = await getJob(id);
   if (!job) throw new Error(`Job ${id} not found`);
   if (isTerminal(job.status)) return job;
-  const ownFileId = localFileId(outputUrl);
+  const ownFileId = await localFileId(outputUrl);
   if (ownFileId) {
     return patchJob(id, { status: "completed", progress: 1, outputUrl, outputFileId: ownFileId }, "Render ready");
   }
@@ -254,20 +258,15 @@ export async function failJob(id: string, error: string): Promise<Job> {
   return patchJob(id, { status: "failed", error }, `Failed: ${error}`);
 }
 
-/** On boot, pick up jobs that were mid-flight when the process last stopped. */
-export async function resumeUnfinishedJobs(opts: RunOptions = {}): Promise<string[]> {
-  const jobs = await listJobs();
-  const pending = jobs.filter((j) => !isTerminal(j.status));
-  for (const job of pending) void runJob(job.id, opts).catch((err) => console.error(`resume ${job.id}`, err));
-  return pending.map((j) => j.id);
-}
-
-/** If the URL points at this app's own file route, return that file id. */
-function localFileId(url: string): string | undefined {
+/** If the URL is one of our own stored files, return that file id. */
+async function localFileId(url: string): Promise<string | undefined> {
   const prefix = `${config().publicBaseUrl}/api/files/`;
-  if (!url.startsWith(prefix)) return undefined;
-  const id = url.slice(prefix.length).split(/[/?#]/)[0];
-  return id.startsWith("file_") ? id : undefined;
+  if (url.startsWith(prefix)) {
+    const id = url.slice(prefix.length).split(/[/?#]/)[0];
+    return id.startsWith("file_") ? id : undefined;
+  }
+  const db = await store().read();
+  return db.files.find((f) => f.url === url)?.id;
 }
 
 function errorMessage(err: unknown): string {

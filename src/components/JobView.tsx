@@ -47,7 +47,9 @@ export function JobView({ initialJob }: { initialJob: Job }) {
           <div className="h-2 w-full overflow-hidden rounded bg-panel">
             <div className="h-full bg-accent transition-all" style={{ width: `${Math.round(job.progress * 100)}%` }} />
           </div>
-          <p className="mt-2 text-sm text-muted">Rendering usually takes a few minutes. You can leave this page; the job continues.</p>
+          <p className="mt-2 text-sm text-muted">
+            Rendering usually takes a few minutes. The provider keeps working if you leave; reopen this page to pick up the result.
+          </p>
         </div>
       )}
 

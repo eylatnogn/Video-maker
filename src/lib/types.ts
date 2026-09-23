@@ -2,10 +2,15 @@
 
 export type ISODate = string;
 
+export type FileBackend = "local" | "blob";
+
 export interface FileRecord {
   id: string;
-  /** Path relative to the storage root. */
+  backend: FileBackend;
+  /** Local backend: path relative to the storage root. Blob backend: the blob pathname. */
   relPath: string;
+  /** Blob backend only: the public URL of the object. */
+  url?: string;
   mime: string;
   size: number;
   originalName: string;

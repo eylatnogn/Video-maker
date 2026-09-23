@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useState } from "react";
+import { uploadFile } from "@/lib/client/upload";
 
 export function PersonaForm({ consentStatement, maxPhotos }: { consentStatement: string; maxPhotos: number }) {
   const router = useRouter();
@@ -9,24 +10,29 @@ export function PersonaForm({ consentStatement, maxPhotos }: { consentStatement:
   const [files, setFiles] = useState<File[]>([]);
   const [consent, setConsent] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
-    setBusy(true);
     try {
-      const form = new FormData();
-      form.set("name", name);
-      form.set("consent", consent ? "on" : "off");
-      for (const f of files) form.append("photos", f);
-      const res = await fetch("/api/personas", { method: "POST", body: form });
+      const photoFileIds: string[] = [];
+      for (const [i, f] of files.entries()) {
+        setBusy(`Uploading photo ${i + 1} of ${files.length}…`);
+        photoFileIds.push((await uploadFile(f, "image")).id);
+      }
+      setBusy("Creating persona…");
+      const res = await fetch("/api/personas", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, consent, photoFileIds }),
+      });
       const body = await res.json();
-      if (!res.ok) throw new Error(body.error ?? "Upload failed");
+      if (!res.ok) throw new Error(body.error ?? "Could not create persona");
       router.push(`/personas/${body.persona.id}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-      setBusy(false);
+      setBusy(null);
     }
   }
 
@@ -83,10 +89,10 @@ export function PersonaForm({ consentStatement, maxPhotos }: { consentStatement:
 
       <button
         type="submit"
-        disabled={busy || !consent || files.length === 0}
+        disabled={busy !== null || !consent || files.length === 0}
         className="rounded bg-accent px-4 py-2 font-medium text-white disabled:opacity-40"
       >
-        {busy ? "Uploading…" : "Create persona"}
+        {busy ?? "Create persona"}
       </button>
     </form>
   );

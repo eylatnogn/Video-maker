@@ -3,6 +3,7 @@ import { config } from "@/lib/config";
 import { failJob, finalize, getJob } from "@/lib/pipeline/jobs";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 /**
  * Optional completion callback. The poll loop already handles completion,

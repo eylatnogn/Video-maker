@@ -6,13 +6,15 @@ import { absolutePath, fileStream, getFile } from "@/lib/storage";
 export const dynamic = "force-dynamic";
 
 /**
- * Serves stored files with HTTP Range support so `<video>` can seek and
- * providers can fetch reference media.
+ * Serves stored files. Blob-backed records redirect to their public URL;
+ * local records are streamed with HTTP Range support so `<video>` can seek
+ * and providers can fetch reference media.
  */
 export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   const record = await getFile(id);
   if (!record) return notFound("File not found");
+  if (record.url) return Response.redirect(record.url, 302);
 
   let size: number;
   try {
